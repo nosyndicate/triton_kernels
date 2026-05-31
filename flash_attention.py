@@ -54,9 +54,8 @@ def _attn_fwd_kernel(
     for start_n in range(0, end_n, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
 
-        # Corrected K pointers for transpose: (BLOCK_SIZE_HEAD_DIM, BLOCK_SIZE_N)
-        # The strides correspond to the logical layout *after* transpose,
-        # so we need to use stride_kn with offs_k and stride_kk with offs_n
+        # K tile: (BLOCK_N, BLOCK_SIZE_HEAD_DIM). It is transposed for q @ k^T
+        # below.
         k_ptrs = (K + batch_id * stride_kb + head_id * stride_kh
                    + offs_n[:,None] * stride_kn + offs_k[None,:] * stride_kk )
         #k_ptrs = (K + batch_id * stride_kz + head_id * stride_kh
@@ -72,24 +71,18 @@ def _attn_fwd_kernel(
         # V mask
         v_mask = offs_n[:, None] < SEQ_LEN
 
-        # Load K tile (shape will be BLOCK_SIZE_HEAD_DIM x BLOCK_SIZE_N due to pointer layout)
+        # Load K tile (BLOCK_N, BLOCK_SIZE_HEAD_DIM)
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
         # Load V tile (shape will be BLOCK_SIZE_N x BLOCK_SIZE_HEAD_DIM)
         v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
 
         # Compute attention scores: Q (M, K) * K^T (K, N) -> (M, N)
-        # tl.dot(q, k, trans_b=True) expects k to have shape (K, N) already
-        # Since we loaded k with shape (BLOCK_SIZE_HEAD_DIM, BLOCK_SIZE_N),
-        # we need to use trans_b=False or simply tl.dot(q, k)
-        #qk = tl.dot(q, tl.trans(k), allow_tf32=False) # Use tl.dot(q, k) if k is loaded with shape (K, N)
-                          # Or use tl.dot(q, k, trans_b=True) if k is loaded with shape (N, K)
-                          # Given our pointer logic for k_ptrs, k is loaded as (K, N)
-                          # So, tl.dot(q, k) is correct for (M, K) * (K, N) -> (M, N)
         #tl.debug_barrier()
         #tl.print(“qk tile =”, qk)
-        qk = tl.dot(q, tl.trans(k))
+        qk = tl.dot(q, tl.trans(k), input_precision="ieee")
         qk*=  softmax_scale
+        qk = tl.where(offs_n[None, :] < SEQ_LEN, qk, float('-inf'))
 
         # Apply causal mask if needed
         if IF_CAUSAL_MASK:
@@ -104,7 +97,7 @@ def _attn_fwd_kernel(
         # Update accumulator
         acc = acc * scale[:, None]
         # p_ij (M, N), v (N, K) -> dot (M, K)
-        acc += tl.dot(p_ij.to(v.dtype), v) # Removed trans_b=True, dot(A, B) expects B with columns matching A rows
+        acc += tl.dot(p_ij.to(v.dtype), v, input_precision="ieee") # Removed trans_b=True, dot(A, B) expects B with columns matching A rows
 
         # Update normalizing factors
         l_i_current = tl.sum(p_ij, axis=1)
@@ -123,11 +116,15 @@ def _attn_fwd_kernel(
 
 def custom_triton_attention(q, k, v):
     batch_size, num_heads, seq_len, head_dim = q.shape
+    if head_dim not in (16, 32, 64, 128):
+        raise ValueError("custom_triton_attention only supports head_dim in {16, 32, 64, 128}")
 
     output = torch.empty_like(q)
     softmax_scale = 1.0 / math.sqrt(head_dim)
 
-    grid = (triton.cdiv(seq_len, 128) ,batch_size * num_heads)
+    BLOCK_M = 64
+    BLOCK_N = 64
+    grid = (triton.cdiv(seq_len, BLOCK_M) ,batch_size * num_heads)
 
     _attn_fwd_kernel[grid](
         q, k, v, output,
@@ -138,8 +135,8 @@ def custom_triton_attention(q, k, v):
         batch_size,
         num_heads,
         seq_len,
-        128,
-        64,
+        BLOCK_M,
+        BLOCK_N,
         head_dim,
         False,
         softmax_scale,
@@ -180,3 +177,6 @@ if __name__ == "__main__":
 
 
     verify_correctness(q, k, v)
+
+    ms = benchmark(custom_triton_attention, q, k, v)
+    print(f"Custom Triton Attention: {ms:.2f} ms")
