@@ -124,7 +124,7 @@ def custom_triton_attention(q, k, v):
 
     BLOCK_M = 64
     BLOCK_N = 64
-    grid = (triton.cdiv(seq_len, BLOCK_M) ,batch_size * num_heads)
+    grid = (triton.cdiv(seq_len, BLOCK_M), batch_size * num_heads)
 
     _attn_fwd_kernel[grid](
         q, k, v, output,
